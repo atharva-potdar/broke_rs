@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::Mutex;
@@ -42,7 +43,8 @@ pub async fn run_broker() -> Result<()> {
 
     // For now, one broadcaster per message_topic
     let map_broadcast = Arc::new(DashMap::new());
-    let map_subscribe = Arc::new(DashMap::<String, Mutex<Vec<OwnedWriteHalf>>>::new());
+    let map_subscribe =
+        Arc::new(DashMap::<String, Mutex<Vec<(SocketAddr, OwnedWriteHalf)>>>::new());
 
     // Buffer size 1024
     let (tx, mut rx) = mpsc::channel::<BroadcastMessage>(1024);
@@ -56,7 +58,7 @@ pub async fn run_broker() -> Result<()> {
             if let Some(subs) = map_subscriber2.get(&msg.message_topic) {
                 loop {
                     if let Ok(mut subs_lock) = subs.try_lock() {
-                        subs_lock.par_iter_mut().for_each(|write_half| {
+                        subs_lock.par_iter_mut().for_each(|(_, write_half)| {
                             let data = message.clone();
                             handle.block_on(async move {
                                 use tokio::io::AsyncWriteExt;
@@ -85,10 +87,29 @@ pub async fn run_broker() -> Result<()> {
         let mut write_half = Some(write_half);
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
+            let mut initialized = false;
+            let mut is_broadcaster = false;
+            let mut message_topic: String = String::new();
             loop {
                 match read_half.read(&mut buf).await {
                     Ok(0) => {
                         println!("Closing connection");
+                        if !is_broadcaster {
+                            if let Some(subs) = map_subscriber.get(&message_topic) {
+                                loop {
+                                    if let Ok(mut subs_lock) = subs.try_lock() {
+                                        if let Some(pos) =
+                                            subs_lock.iter().position(|(a, _)| *a == addr)
+                                        {
+                                            subs_lock.swap_remove(pos);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            map_broadcaster.remove(&message_topic);
+                        }
                         break;
                     }
                     Ok(n) => match serde_json::from_slice::<Payload>(&buf[..n]) {
@@ -96,16 +117,25 @@ pub async fn run_broker() -> Result<()> {
                             println!("Request from {addr}: {msg:#?}");
                             match msg.request_type {
                                 RequestType::NewBroadcaster => {
-                                    map_broadcaster.insert(msg.message_topic.clone(), addr);
-                                    map_subscriber.entry(msg.message_topic).or_default();
+                                    if !initialized {
+                                        message_topic = msg.message_topic.clone();
+                                        map_broadcaster.insert(msg.message_topic.clone(), addr);
+                                        map_subscriber.entry(msg.message_topic).or_default();
+                                        initialized = true;
+                                        is_broadcaster = true;
+                                    }
                                 }
                                 RequestType::NewSubscriber => {
-                                    let entry =
-                                        map_subscriber.entry(msg.message_topic).or_default();
-                                    loop {
-                                        if let Ok(mut subs) = entry.try_lock() {
-                                            subs.push(write_half.take().unwrap());
-                                            break;
+                                    if !initialized {
+                                        message_topic = msg.message_topic.clone();
+                                        let entry =
+                                            map_subscriber.entry(msg.message_topic).or_default();
+                                        initialized = true;
+                                        loop {
+                                            if let Ok(mut subs) = entry.try_lock() {
+                                                subs.push((addr, write_half.take().unwrap()));
+                                                break;
+                                            }
                                         }
                                     }
                                 }
