@@ -121,18 +121,8 @@ pub async fn run_broker() -> Result<()> {
                         if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                             if io_err.kind() == ErrorKind::UnexpectedEof {
                                 println!("Closing connection");
-                                let subs =
-                                    map_subscriber.get(&message_topic).map(|v| Arc::clone(&v));
-                                if is_broadcaster {
-                                    map_broadcaster.remove(&message_topic);
-                                } else if let Some(subs) = subs {
-                                    let mut subs_lock = subs.lock().await;
-                                    if let Some(pos) =
-                                        subs_lock.iter().position(|(a, _)| *a == addr)
-                                    {
-                                        subs_lock.swap_remove(pos);
-                                    }
-                                }
+                            } else {
+                                println!("Error reading: {e}");
                             }
                         } else {
                             println!("Error reading: {e}");
@@ -211,6 +201,22 @@ pub async fn run_broker() -> Result<()> {
                     },
                 }
             }
+
+            // Cleanup regardless of why the loop exited
+            let subs = map_subscriber.get(&message_topic).map(|v| Arc::clone(&v));
+            if is_broadcaster {
+                map_broadcaster.remove(&message_topic);
+            } else if let Some(subs) = subs {
+                let mut subs_lock = subs.lock().await;
+                if let Some(pos) = subs_lock.iter().position(|(a, _)| *a == addr) {
+                    subs_lock.swap_remove(pos);
+                }
+                if subs_lock.is_empty() {
+                    drop(subs_lock);
+                    map_subscribe.remove(&message_topic);
+                }
+            }
+            println!("Cleaned up connection: {addr}");
         });
     }
 }
