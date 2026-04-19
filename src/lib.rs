@@ -11,8 +11,6 @@ use serde::{Deserialize, Serialize};
 
 use anyhow::Result;
 
-use rayon::prelude::*;
-
 #[derive(Debug, Serialize, Deserialize)]
 enum RequestType {
     NewBroadcaster,
@@ -43,8 +41,10 @@ pub async fn run_broker() -> Result<()> {
 
     // For now, one broadcaster per message_topic
     let map_broadcast = Arc::new(DashMap::new());
-    let map_subscribe =
-        Arc::new(DashMap::<String, Mutex<Vec<(SocketAddr, OwnedWriteHalf)>>>::new());
+    let map_subscribe = Arc::new(DashMap::<
+        String,
+        Arc<Mutex<Vec<(SocketAddr, OwnedWriteHalf)>>>,
+    >::new());
 
     // Buffer size 1024
     let (tx, mut rx) = mpsc::channel::<BroadcastMessage>(1024);
@@ -52,21 +52,16 @@ pub async fn run_broker() -> Result<()> {
     let map_subscriber2 = Arc::clone(&map_subscribe);
 
     tokio::spawn(async move {
-        let handle = tokio::runtime::Handle::current();
         while let Some(msg) = rx.recv().await {
             let message = serde_json::to_vec(&msg).unwrap();
-            if let Some(subs) = map_subscriber2.get(&msg.message_topic) {
-                loop {
-                    if let Ok(mut subs_lock) = subs.try_lock() {
-                        subs_lock.par_iter_mut().for_each(|(_, write_half)| {
-                            let data = message.clone();
-                            handle.block_on(async move {
-                                use tokio::io::AsyncWriteExt;
-                                write_half.write_all(&data).await.unwrap();
-                            });
-                        });
-                        break;
-                    }
+            let subs = map_subscriber2
+                .get(&msg.message_topic)
+                .map(|v| Arc::clone(&v));
+            if let Some(subs) = subs {
+                let mut subs_lock = subs.lock().await;
+                for (_, write_half) in subs_lock.iter_mut() {
+                    use tokio::io::AsyncWriteExt;
+                    write_half.write_all(&message).await.unwrap();
                 }
             }
         }
@@ -94,18 +89,13 @@ pub async fn run_broker() -> Result<()> {
                 match read_half.read(&mut buf).await {
                     Ok(0) => {
                         println!("Closing connection");
+                        let subs = map_subscriber.get(&message_topic).map(|v| Arc::clone(&v));
                         if is_broadcaster {
                             map_broadcaster.remove(&message_topic);
-                        } else if let Some(subs) = map_subscriber.get(&message_topic) {
-                            loop {
-                                if let Ok(mut subs_lock) = subs.try_lock() {
-                                    if let Some(pos) =
-                                        subs_lock.iter().position(|(a, _)| *a == addr)
-                                    {
-                                        subs_lock.swap_remove(pos);
-                                    }
-                                    break;
-                                }
+                        } else if let Some(subs) = subs {
+                            let mut subs_lock = subs.lock().await;
+                            if let Some(pos) = subs_lock.iter().position(|(a, _)| *a == addr) {
+                                subs_lock.swap_remove(pos);
                             }
                         }
                         break;
@@ -118,7 +108,9 @@ pub async fn run_broker() -> Result<()> {
                                     if !initialized {
                                         message_topic.clone_from(&msg.message_topic);
                                         map_broadcaster.insert(msg.message_topic.clone(), addr);
-                                        map_subscriber.entry(msg.message_topic).or_default();
+                                        map_subscriber
+                                            .entry(msg.message_topic)
+                                            .or_insert_with(|| Arc::new(Mutex::new(Vec::new())));
                                         initialized = true;
                                         is_broadcaster = true;
                                     }
@@ -126,15 +118,12 @@ pub async fn run_broker() -> Result<()> {
                                 RequestType::NewSubscriber => {
                                     if !initialized {
                                         message_topic.clone_from(&msg.message_topic);
-                                        let entry =
-                                            map_subscriber.entry(msg.message_topic).or_default();
+                                        let entry = map_subscriber
+                                            .entry(msg.message_topic)
+                                            .or_insert_with(|| Arc::new(Mutex::new(Vec::new())));
                                         initialized = true;
-                                        loop {
-                                            if let Ok(mut subs) = entry.try_lock() {
-                                                subs.push((addr, write_half.take().unwrap()));
-                                                break;
-                                            }
-                                        }
+                                        let mut subs = entry.lock().await;
+                                        subs.push((addr, write_half.take().unwrap()));
                                     }
                                 }
                             }
