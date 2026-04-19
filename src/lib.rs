@@ -53,15 +53,28 @@ pub async fn run_broker() -> Result<()> {
 
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            let message = serde_json::to_vec(&msg).unwrap();
+            let message = match serde_json::to_vec(&msg) {
+                Ok(m) => m,
+                Err(e) => {
+                    println!("Failed to serialize message: {e}");
+                    continue;
+                }
+            };
             let subs = map_subscriber2
                 .get(&msg.message_topic)
                 .map(|v| Arc::clone(&v));
             if let Some(subs) = subs {
                 let mut subs_lock = subs.lock().await;
-                for (_, write_half) in subs_lock.iter_mut() {
+                let mut dead = vec![];
+                for (i, (_, write_half)) in subs_lock.iter_mut().enumerate() {
                     use tokio::io::AsyncWriteExt;
-                    write_half.write_all(&message).await.unwrap();
+                    if let Err(e) = write_half.write_all(&message).await {
+                        println!("Failed to write to subscriber, removing: {e}");
+                        dead.push(i);
+                    }
+                }
+                for i in dead.into_iter().rev() {
+                    subs_lock.swap_remove(i);
                 }
             }
         }
@@ -121,14 +134,28 @@ pub async fn run_broker() -> Result<()> {
                                         let entry = map_subscriber
                                             .entry(msg.message_topic)
                                             .or_insert_with(|| Arc::new(Mutex::new(Vec::new())));
+                                        let subs_arc = Arc::clone(&entry);
+                                        drop(entry);
                                         initialized = true;
-                                        let mut subs = entry.lock().await;
-                                        subs.push((addr, write_half.take().unwrap()));
+                                        if let Some(wh) = write_half.take() {
+                                            subs_arc.lock().await.push((addr, wh));
+                                        } else {
+                                            println!(
+                                                "Write half already taken, closing connection"
+                                            );
+                                            break;
+                                        }
                                     }
                                 }
                             }
                         }
                         Ok(Payload::Broadcast(msg)) => {
+                            if !initialized {
+                                println!(
+                                    "Client sent broadcast before registering, closing connection"
+                                );
+                                break;
+                            }
                             if let Some(broadcaster_addr) = map_broadcaster.get(&msg.message_topic)
                             {
                                 if addr == *broadcaster_addr {
