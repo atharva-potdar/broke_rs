@@ -37,6 +37,8 @@ enum Payload {
     Broadcast(BroadcastMessage),
 }
 
+const MAX_MESSAGE_SIZE: usize = 1024 * 1024; // 1MB
+
 async fn write_framed(writer: &mut OwnedWriteHalf, data: &[u8]) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let len = u32::try_from(data.len());
@@ -50,6 +52,9 @@ async fn read_framed(reader: &mut tokio::net::tcp::OwnedReadHalf) -> Result<Vec<
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_MESSAGE_SIZE {
+        anyhow::bail!("Message size {len} exceeds maximum allowed size");
+    }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await?;
     Ok(buf)
@@ -217,7 +222,11 @@ pub async fn run_broker() -> Result<()> {
                 }
                 if subs_lock.is_empty() {
                     drop(subs_lock);
-                    map_subscriber.remove(&message_topic);
+                    map_subscriber.remove_if(&message_topic, |_, arc_mutex| {
+                        arc_mutex
+                            .try_lock()
+                            .is_ok_and(|inner_guard| inner_guard.is_empty())
+                    });
                 }
             }
             println!("Cleaned up connection: {addr}");
