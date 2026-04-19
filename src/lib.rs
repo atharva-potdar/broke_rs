@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 
 use serde::{Deserialize, Serialize};
@@ -67,7 +68,7 @@ pub async fn run_broker() -> Result<()> {
     let map_broadcast = Arc::new(DashMap::new());
     let map_subscribe = Arc::new(DashMap::<
         String,
-        Arc<Mutex<Vec<(SocketAddr, OwnedWriteHalf)>>>,
+        Arc<RwLock<Vec<(SocketAddr, Arc<Mutex<OwnedWriteHalf>>)>>>,
     >::new());
 
     // Buffer size 1024
@@ -77,31 +78,51 @@ pub async fn run_broker() -> Result<()> {
 
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            let message = match serde_json::to_vec(&msg) {
+            let message = Arc::new(match serde_json::to_vec(&msg) {
                 Ok(m) => m,
                 Err(e) => {
                     println!("Failed to serialize message: {e}");
                     continue;
                 }
-            };
+            });
             let subs = map_subscriber2
                 .get(&msg.message_topic)
                 .map(|v| Arc::clone(&v));
             if let Some(subs) = subs {
-                let mut subs_lock = subs.lock().await;
-                let futs = subs_lock
-                    .iter_mut()
-                    .map(|(_, write_half)| write_framed(write_half, &message));
-                let results = futures::future::join_all(futs).await;
-                let mut dead = vec![];
-                for (i, result) in results.into_iter().enumerate() {
-                    if let Err(e) = result {
-                        println!("Failed to write to subscriber, removing: {e}");
-                        dead.push(i);
+                let handles: Vec<(SocketAddr, Arc<Mutex<OwnedWriteHalf>>)> = {
+                    let subs_lock = subs.read().await;
+                    subs_lock
+                        .iter()
+                        .map(|(addr, m)| (*addr, Arc::clone(m)))
+                        .collect()
+                };
+
+                let futs = handles.iter().map(|(addr, write_half_mutex)| {
+                    let message = Arc::clone(&message);
+                    let write_half_mutex = Arc::clone(write_half_mutex);
+                    let addr = *addr;
+                    async move {
+                        let mut write_half = write_half_mutex.lock().await;
+                        (addr, write_framed(&mut write_half, &message).await)
                     }
-                }
-                for i in dead.into_iter().rev() {
-                    subs_lock.swap_remove(i);
+                });
+
+                let results = futures::future::join_all(futs).await;
+                let dead: std::collections::HashSet<SocketAddr> = results
+                    .into_iter()
+                    .filter_map(|(addr, result)| {
+                        if let Err(e) = result {
+                            println!("Failed to write to subscriber {addr}, removing: {e}");
+                            Some(addr)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                if !dead.is_empty() {
+                    let mut subs_write = subs.write().await;
+                    subs_write.retain(|(addr, _)| !dead.contains(addr));
                 }
             }
         }
@@ -155,7 +176,7 @@ pub async fn run_broker() -> Result<()> {
                                         map_broadcaster.insert(msg.message_topic.clone(), addr);
                                         map_subscriber
                                             .entry(msg.message_topic)
-                                            .or_insert_with(|| Arc::new(Mutex::new(Vec::new())));
+                                            .or_insert_with(|| Arc::new(RwLock::new(Vec::new())));
                                         initialized = true;
                                         is_broadcaster = true;
                                     }
@@ -165,12 +186,15 @@ pub async fn run_broker() -> Result<()> {
                                         message_topic.clone_from(&msg.message_topic);
                                         let entry = map_subscriber
                                             .entry(msg.message_topic)
-                                            .or_insert_with(|| Arc::new(Mutex::new(Vec::new())));
+                                            .or_insert_with(|| Arc::new(RwLock::new(Vec::new())));
                                         let subs_arc = Arc::clone(&entry);
                                         drop(entry);
                                         initialized = true;
                                         if let Some(wh) = write_half.take() {
-                                            subs_arc.lock().await.push((addr, wh));
+                                            subs_arc
+                                                .write()
+                                                .await
+                                                .push((addr, Arc::new(Mutex::new(wh))));
                                         } else {
                                             println!(
                                                 "Write half already taken, closing connection"
@@ -216,15 +240,15 @@ pub async fn run_broker() -> Result<()> {
             if is_broadcaster {
                 map_broadcaster.remove(&message_topic);
             } else if let Some(subs) = subs {
-                let mut subs_lock = subs.lock().await;
+                let mut subs_lock = subs.write().await;
                 if let Some(pos) = subs_lock.iter().position(|(a, _)| *a == addr) {
                     subs_lock.swap_remove(pos);
                 }
                 if subs_lock.is_empty() {
                     drop(subs_lock);
-                    map_subscriber.remove_if(&message_topic, |_, arc_mutex| {
-                        arc_mutex
-                            .try_lock()
+                    map_subscriber.remove_if(&message_topic, |_, arc_rwlock| {
+                        arc_rwlock
+                            .try_read()
                             .is_ok_and(|inner_guard| inner_guard.is_empty())
                     });
                 }
