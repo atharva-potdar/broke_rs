@@ -203,18 +203,34 @@ pub async fn run_broker() -> Result<()> {
                                 }
                                 RequestType::NewSubscriber => {
                                     if !initialized {
-                                        message_topic.clone_from(&msg.message_topic);
-                                        let entry = map_subscriber
-                                            .entry(msg.message_topic)
-                                            .or_insert_with(|| Arc::new(RwLock::new(Vec::new())));
-                                        let subs_arc = Arc::clone(&entry);
-                                        drop(entry);
-                                        initialized = true;
                                         if let Some(wh) = write_half.take() {
-                                            subs_arc
-                                                .write()
-                                                .await
-                                                .push((addr, Arc::new(Mutex::new(wh))));
+                                            loop {
+                                                let subs_arc = {
+                                                    let entry = map_subscriber
+                                                        .entry(msg.message_topic.clone())
+                                                        .or_insert_with(|| {
+                                                            Arc::new(RwLock::new(Vec::new()))
+                                                        });
+                                                    Arc::clone(&entry)
+                                                };
+
+                                                let mut write_guard = subs_arc.write().await;
+
+                                                let is_valid = map_subscriber
+                                                    .get(&msg.message_topic)
+                                                    .is_some_and(|current_arc| {
+                                                        Arc::ptr_eq(&current_arc, &subs_arc)
+                                                    });
+
+                                                if is_valid {
+                                                    write_guard
+                                                        .push((addr, Arc::new(Mutex::new(wh))));
+                                                    drop(write_guard); // Tighten the drop
+                                                    message_topic = msg.message_topic.clone();
+                                                    initialized = true;
+                                                    break;
+                                                }
+                                            }
                                         } else {
                                             println!(
                                                 "Write half already taken, closing connection"
@@ -266,6 +282,11 @@ pub async fn run_broker() -> Result<()> {
             let subs = map_subscriber.get(&message_topic).map(|v| Arc::clone(&v));
             if is_broadcaster {
                 map_broadcaster.remove(&message_topic);
+                map_subscriber.remove_if(&message_topic, |_, arc_rwlock| {
+                    arc_rwlock
+                        .try_read()
+                        .is_ok_and(|inner_guard| inner_guard.is_empty())
+                });
             } else if let Some(subs) = subs {
                 let mut subs_lock = subs.write().await;
                 if let Some(pos) = subs_lock.iter().position(|(a, _)| *a == addr) {
