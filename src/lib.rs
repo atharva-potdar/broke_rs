@@ -94,21 +94,19 @@ pub async fn run_broker() -> Result<()> {
                 match read_half.read(&mut buf).await {
                     Ok(0) => {
                         println!("Closing connection");
-                        if !is_broadcaster {
-                            if let Some(subs) = map_subscriber.get(&message_topic) {
-                                loop {
-                                    if let Ok(mut subs_lock) = subs.try_lock() {
-                                        if let Some(pos) =
-                                            subs_lock.iter().position(|(a, _)| *a == addr)
-                                        {
-                                            subs_lock.swap_remove(pos);
-                                        }
-                                        break;
+                        if is_broadcaster {
+                            map_broadcaster.remove(&message_topic);
+                        } else if let Some(subs) = map_subscriber.get(&message_topic) {
+                            loop {
+                                if let Ok(mut subs_lock) = subs.try_lock() {
+                                    if let Some(pos) =
+                                        subs_lock.iter().position(|(a, _)| *a == addr)
+                                    {
+                                        subs_lock.swap_remove(pos);
                                     }
+                                    break;
                                 }
                             }
-                        } else {
-                            map_broadcaster.remove(&message_topic);
                         }
                         break;
                     }
@@ -118,7 +116,7 @@ pub async fn run_broker() -> Result<()> {
                             match msg.request_type {
                                 RequestType::NewBroadcaster => {
                                     if !initialized {
-                                        message_topic = msg.message_topic.clone();
+                                        message_topic.clone_from(&msg.message_topic);
                                         map_broadcaster.insert(msg.message_topic.clone(), addr);
                                         map_subscriber.entry(msg.message_topic).or_default();
                                         initialized = true;
@@ -127,7 +125,7 @@ pub async fn run_broker() -> Result<()> {
                                 }
                                 RequestType::NewSubscriber => {
                                     if !initialized {
-                                        message_topic = msg.message_topic.clone();
+                                        message_topic.clone_from(&msg.message_topic);
                                         let entry =
                                             map_subscriber.entry(msg.message_topic).or_default();
                                         initialized = true;
@@ -142,21 +140,19 @@ pub async fn run_broker() -> Result<()> {
                             }
                         }
                         Ok(Payload::Broadcast(msg)) => {
-                            match map_broadcaster.get(&msg.message_topic) {
-                                Some(broadcaster_addr) => {
-                                    if addr == *broadcaster_addr {
-                                        match tx_clone.send(msg).await {
-                                            Ok(()) => println!("Broadcasted message"),
-                                            Err(e) => println!("Error: {e}"),
-                                        }
-                                    } else {
-                                        println!("Subscriber cannot broadcast messages");
+                            if let Some(broadcaster_addr) = map_broadcaster.get(&msg.message_topic)
+                            {
+                                if addr == *broadcaster_addr {
+                                    match tx_clone.send(msg).await {
+                                        Ok(()) => println!("Broadcasted message"),
+                                        Err(e) => println!("Error: {e}"),
                                     }
+                                } else {
+                                    println!("Subscriber cannot broadcast messages");
                                 }
-                                None => {
-                                    println!("No topic {}", msg.message_topic);
-                                    break;
-                                }
+                            } else {
+                                println!("No topic {}", msg.message_topic);
+                                break;
                             }
                         }
                         Err(e) => {
