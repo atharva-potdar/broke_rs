@@ -84,9 +84,13 @@ pub async fn run_broker() -> Result<()> {
                 .map(|v| Arc::clone(&v));
             if let Some(subs) = subs {
                 let mut subs_lock = subs.lock().await;
+                let futs = subs_lock
+                    .iter_mut()
+                    .map(|(_, write_half)| write_framed(write_half, &message));
+                let results = futures::future::join_all(futs).await;
                 let mut dead = vec![];
-                for (i, (_, write_half)) in subs_lock.iter_mut().enumerate() {
-                    if let Err(e) = write_framed(write_half, &message).await {
+                for (i, result) in results.into_iter().enumerate() {
+                    if let Err(e) = result {
                         println!("Failed to write to subscriber, removing: {e}");
                         dead.push(i);
                     }
@@ -213,7 +217,7 @@ pub async fn run_broker() -> Result<()> {
                 }
                 if subs_lock.is_empty() {
                     drop(subs_lock);
-                    map_subscribe.remove(&message_topic);
+                    map_subscriber.remove(&message_topic);
                 }
             }
             println!("Cleaned up connection: {addr}");
