@@ -250,6 +250,7 @@ pub async fn run_broker() -> Result<()> {
                             }
                             if !is_broadcaster {
                                 println!("Subscriber cannot broadcast messages");
+                                break;
                             }
                             if msg.message_topic != message_topic {
                                 println!(
