@@ -39,6 +39,7 @@ enum Payload {
 }
 
 const MAX_MESSAGE_SIZE: usize = 1024 * 1024; // 1MB
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn write_framed(writer: &mut OwnedWriteHalf, data: &[u8]) -> Result<()> {
     use tokio::io::AsyncWriteExt;
@@ -102,8 +103,17 @@ pub async fn run_broker() -> Result<()> {
                     let write_half_mutex = Arc::clone(write_half_mutex);
                     let addr = *addr;
                     async move {
-                        let mut write_half = write_half_mutex.lock().await;
-                        (addr, write_framed(&mut write_half, &message).await)
+                        let result =
+                            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                                let mut write_half = write_half_mutex.lock().await;
+                                write_framed(&mut write_half, &message).await
+                            })
+                            .await;
+                        match result {
+                            Ok(Ok(())) => (addr, Ok(())),
+                            Ok(Err(e)) => (addr, Err(e)),
+                            Err(_) => (addr, Err(anyhow::anyhow!("Write timed out for {addr}"))),
+                        }
                     }
                 });
 
@@ -146,8 +156,12 @@ pub async fn run_broker() -> Result<()> {
             let mut is_broadcaster = false;
             let mut message_topic: String = String::new();
             loop {
-                match read_framed(&mut read_half).await {
-                    Err(e) => {
+                match tokio::time::timeout(READ_TIMEOUT, read_framed(&mut read_half)).await {
+                    Err(_) => {
+                        println!("Read timeout for {addr}, closing connection");
+                        break;
+                    }
+                    Ok(Err(e)) => {
                         if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                             if io_err.kind() == ErrorKind::UnexpectedEof {
                                 println!("Closing connection");
@@ -159,7 +173,7 @@ pub async fn run_broker() -> Result<()> {
                         }
                         break;
                     }
-                    Ok(buf) => match serde_json::from_slice::<Payload>(&buf) {
+                    Ok(Ok(buf)) => match serde_json::from_slice::<Payload>(&buf) {
                         Ok(Payload::Request(msg)) => {
                             println!("Request from {addr}: {msg:#?}");
                             match msg.request_type {
@@ -218,6 +232,9 @@ pub async fn run_broker() -> Result<()> {
                                 );
                                 break;
                             }
+                            if !is_broadcaster {
+                                println!("Subscriber cannot broadcast messages");
+                            }
                             if msg.message_topic != message_topic {
                                 println!(
                                     "Client sent broadcast to wrong topic, closing connection"
@@ -231,8 +248,6 @@ pub async fn run_broker() -> Result<()> {
                                         Ok(()) => println!("Broadcasted message"),
                                         Err(e) => println!("Error: {e}"),
                                     }
-                                } else {
-                                    println!("Subscriber cannot broadcast messages");
                                 }
                             } else {
                                 println!("No topic {}", msg.message_topic);
