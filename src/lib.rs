@@ -144,6 +144,13 @@ pub async fn run_broker() -> Result<()> {
                             println!("Request from {addr}: {msg:#?}");
                             match msg.request_type {
                                 RequestType::NewBroadcaster => {
+                                    if map_broadcaster.contains_key(&msg.message_topic) {
+                                        println!(
+                                            "Topic {} already has a broadcaster, closing connection",
+                                            msg.message_topic
+                                        );
+                                        break;
+                                    }
                                     if !initialized {
                                         message_topic.clone_from(&msg.message_topic);
                                         map_broadcaster.insert(msg.message_topic.clone(), addr);
