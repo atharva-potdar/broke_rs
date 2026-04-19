@@ -212,6 +212,12 @@ pub async fn run_broker() -> Result<()> {
                                 );
                                 break;
                             }
+                            if msg.message_topic != message_topic {
+                                println!(
+                                    "Client sent broadcast to wrong topic, closing connection"
+                                );
+                                break;
+                            }
                             if let Some(broadcaster_addr) = map_broadcaster.get(&msg.message_topic)
                             {
                                 if addr == *broadcaster_addr {
