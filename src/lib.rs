@@ -164,21 +164,27 @@ pub async fn run_broker() -> Result<()> {
                             println!("Request from {addr}: {msg:#?}");
                             match msg.request_type {
                                 RequestType::NewBroadcaster => {
-                                    if map_broadcaster.contains_key(&msg.message_topic) {
-                                        println!(
-                                            "Topic {} already has a broadcaster, closing connection",
-                                            msg.message_topic
-                                        );
-                                        break;
-                                    }
                                     if !initialized {
-                                        message_topic.clone_from(&msg.message_topic);
-                                        map_broadcaster.insert(msg.message_topic.clone(), addr);
-                                        map_subscriber
-                                            .entry(msg.message_topic)
-                                            .or_insert_with(|| Arc::new(RwLock::new(Vec::new())));
-                                        initialized = true;
-                                        is_broadcaster = true;
+                                        match map_broadcaster.entry(msg.message_topic.clone()) {
+                                            dashmap::mapref::entry::Entry::Occupied(_) => {
+                                                println!(
+                                                    "Topic {} already has a broadcaster, closing connection",
+                                                    msg.message_topic
+                                                );
+                                                break;
+                                            }
+                                            dashmap::mapref::entry::Entry::Vacant(v) => {
+                                                message_topic.clone_from(&msg.message_topic);
+                                                v.insert(addr);
+                                                map_subscriber
+                                                    .entry(msg.message_topic)
+                                                    .or_insert_with(|| {
+                                                        Arc::new(RwLock::new(Vec::new()))
+                                                    });
+                                                initialized = true;
+                                                is_broadcaster = true;
+                                            }
+                                        }
                                     }
                                 }
                                 RequestType::NewSubscriber => {
