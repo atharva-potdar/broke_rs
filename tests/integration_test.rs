@@ -7,11 +7,20 @@ async fn make_conn() -> TcpStream {
     TcpStream::connect("127.0.0.1:8080").await.unwrap()
 }
 
-async fn send(stream: &mut TcpStream, payload: serde_json::Value) {
-    stream
-        .write_all(serde_json::to_vec(&payload).unwrap().as_slice())
-        .await
-        .unwrap();
+async fn send_framed(stream: &mut TcpStream, payload: serde_json::Value) {
+    let data = serde_json::to_vec(&payload).unwrap();
+    let len = data.len() as u32;
+    stream.write_all(&len.to_be_bytes()).await.unwrap();
+    stream.write_all(&data).await.unwrap();
+}
+
+async fn recv_framed(stream: &mut TcpStream) -> serde_json::Value {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await.unwrap();
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).await.unwrap();
+    serde_json::from_slice(&buf).unwrap()
 }
 
 #[tokio::test]
@@ -20,7 +29,7 @@ async fn test_broadcast() {
     sleep(Duration::from_millis(100)).await;
 
     let mut broadcaster = make_conn().await;
-    send(
+    send_framed(
         &mut broadcaster,
         json!({"request_type": "NewBroadcaster", "message_topic": "match.1234"}),
     )
@@ -31,39 +40,32 @@ async fn test_broadcast() {
     let mut sub2 = make_conn().await;
     let mut sub3 = make_conn().await;
 
-    send(
+    send_framed(
         &mut sub1,
         json!({"request_type": "NewSubscriber", "message_topic": "match.1234"}),
     )
     .await;
-    send(
+    send_framed(
         &mut sub2,
         json!({"request_type": "NewSubscriber", "message_topic": "match.1234"}),
     )
     .await;
-    send(
+    send_framed(
         &mut sub3,
         json!({"request_type": "NewSubscriber", "message_topic": "match.1234"}),
     )
     .await;
     sleep(Duration::from_millis(100)).await;
 
-    send(
+    send_framed(
         &mut broadcaster,
         json!({"message_topic": "match.1234", "message": "GOAL! 1-0"}),
     )
     .await;
 
-    let mut buf = [0u8; 1024];
-
-    let n = sub1.read(&mut buf).await.unwrap();
-    let msg1: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
-
-    let n = sub2.read(&mut buf).await.unwrap();
-    let msg2: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
-
-    let n = sub3.read(&mut buf).await.unwrap();
-    let msg3: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
+    let msg1 = recv_framed(&mut sub1).await;
+    let msg2 = recv_framed(&mut sub2).await;
+    let msg3 = recv_framed(&mut sub3).await;
 
     assert_eq!(msg1["message"], "GOAL! 1-0");
     assert_eq!(msg2["message"], "GOAL! 1-0");
